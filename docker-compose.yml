@@ -1,0 +1,13 @@
+services:
+  mybot:
+    build: .
+    image: mybot:latest
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    networks:
+      - bots
+
+networks:
+  bots:
+    external: true
