@@ -11,6 +11,8 @@ from generators import (
     list_pending, list_user_payments, get_payment_compact, export_payments_csv,
     set_approver, set_viewer,
 )
+# New imports for method deletion
+from generators import delete_method, list_custom_methods, ALLOWED_METHODS
 
 router = Router()
 
@@ -49,10 +51,9 @@ def category_kb() -> InlineKeyboardMarkup:
 def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
     rows = []
     for mid, name in list_methods():
+        # use method name in callback to match cb_pick_method("methodname:")
         rows.append([InlineKeyboardButton(text=name, callback_data=f"methodname:{name}")])
-    if include_nav:
-        rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"),
-                     InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")])
+    # removed Back/Cancel for this keyboard per request
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def kb_group_approve(pid: int) -> InlineKeyboardMarkup:
@@ -139,18 +140,16 @@ async def cmd_set_initiator_cmd(message: Message) -> None:
     Менять может только текущий initiator (если уже есть).
     Если initiатор ещё не задан — первый вызов команды создаст его.
     """
-    roles = get_roles()
-    current_init = roles["initiator_id"]
-
     parts = (message.text or "").split()
     if len(parts) != 2 or not parts[1].isdigit():
         await message.answer("Usage: /set_initiator <id>")
         return
 
     new_init = int(parts[1])
+    current_init = get_roles()["initiator_id"]
 
     # Если инициатор уже задан — менять может только он
-    if current_init is not None and message.from_user.id != current_init:
+    if current_init is not None and message.from_user and message.from_user.id != current_init:
         await message.answer("Only current initiator can change initiator ID.")
         return
 
@@ -164,7 +163,7 @@ async def cmd_set_approver_cmd(message: Message) -> None:
     Менять может текущий initiator.
     """
     roles = get_roles()
-    if not roles["initiator_id"] or message.from_user.id != roles["initiator_id"]:
+    if not roles["initiator_id"] or (message.from_user and message.from_user.id != roles["initiator_id"]):
         await message.answer("Only initiator can change approver. Ask admin to change roles.")
         return
 
@@ -184,7 +183,7 @@ async def cmd_set_viewer_cmd(message: Message) -> None:
     Менять может текущий initiator.
     """
     roles = get_roles()
-    if not roles["initiator_id"] or message.from_user.id != roles["initiator_id"]:
+    if not roles["initiator_id"] or (message.from_user and message.from_user.id != roles["initiator_id"]):
         await message.answer("Only initiator can change viewer. Ask admin to change roles.")
         return
 
@@ -221,6 +220,79 @@ async def cmd_methods(message: Message) -> None:
     text = "Methods:\n" + "\n".join([f"- {name} (id {mid})" for mid, name in rows])
     await message.answer(text)
 
+# New: delete method command (initiator only)
+@router.message(Command("delete_method"))
+@router.message(Command("del_method"))
+async def cmd_delete_method(message: Message) -> None:
+    roles = get_roles()
+    if roles["initiator_id"] is None or (message.from_user and message.from_user.id != roles["initiator_id"]):
+        await message.answer("Only initiator can delete methods.")
+        return
+    rows = list_custom_methods()
+    if not rows:
+        await message.answer("No deletable methods found.")
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=f"🗑️ {name}", callback_data=f"delm:{mid}")] for mid, name in rows] + [[InlineKeyboardButton(text="✖️ Cancel", callback_data="delmcancel")]])
+    await message.answer("Choose a method to delete:", reply_markup=kb)
+
+@router.callback_query(F.data.startswith("delm:"))
+async def cb_delete_method_confirm(call: CallbackQuery) -> None:
+    roles = get_roles()
+    if roles["initiator_id"] is None or call.from_user.id != roles["initiator_id"]:
+        await call.answer("Only initiator can delete methods", show_alert=True)
+        return
+    try:
+        mid = int(call.data.split(":")[1])
+    except Exception:
+        await call.answer("Invalid request", show_alert=True)
+        return
+    m = get_method_by_id(mid)
+    if not m:
+        await call.answer("Method not found", show_alert=True)
+        return
+    name = m["name"]
+    if name in ALLOWED_METHODS:
+        await call.answer("Cannot delete system method", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Confirm delete", callback_data=f"delmcf:{mid}")],
+        [InlineKeyboardButton(text="✖️ Cancel", callback_data="delmcancel")]
+    ])
+    try:
+        await call.message.edit_text(f"Delete method '{name}'? This cannot be undone.", reply_markup=kb)
+    except Exception:
+        await call.message.answer(f"Delete method '{name}'? This cannot be undone.", reply_markup=kb)
+    await call.answer()
+
+@router.callback_query(F.data == "delmcancel")
+async def cb_delete_method_cancel(call: CallbackQuery) -> None:
+    try:
+        await call.message.edit_text("Deletion cancelled.")
+    except Exception:
+        await call.message.answer("Deletion cancelled.")
+    await call.answer()
+
+@router.callback_query(F.data.startswith("delmcf:"))
+async def cb_delete_method_do(call: CallbackQuery) -> None:
+    roles = get_roles()
+    if roles["initiator_id"] is None or call.from_user.id != roles["initiator_id"]:
+        await call.answer("Only initiator can delete methods", show_alert=True)
+        return
+    try:
+        mid = int(call.data.split(":")[1])
+    except Exception:
+        await call.answer("Invalid request", show_alert=True)
+        return
+    ok, msg = delete_method(mid)
+    if ok:
+        try:
+            await call.message.edit_text("✅ Method deleted.")
+        except Exception:
+            await call.message.answer("✅ Method deleted.")
+        await call.answer("Deleted")
+    else:
+        await call.answer(msg, show_alert=True)
+
 # ========= Списки и экспорт =========
 @router.message(Command("pending"))
 async def cmd_pending(message: Message) -> None:
@@ -242,7 +314,7 @@ async def cmd_my(message: Message) -> None:
 
 @router.message(Command("pay"))
 async def cmd_pay(message: Message) -> None:
-    parts = message.text.split(maxsplit=1)
+    parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip().lstrip("#PAY-").isdigit():
         await message.answer("Usage: /pay <id>  (example: /pay 12)")
         return
@@ -273,7 +345,7 @@ async def newpay_start(message: Message, state: FSMContext) -> None:
     if roles["initiator_id"] is None:
         set_initiator(message.from_user.id)
         roles = get_roles()
-    if roles["initiator_id"] and message.from_user.id != roles["initiator_id"]:
+    if roles["initiator_id"] and (message.from_user and message.from_user.id != roles["initiator_id"]):
         await message.answer("Only initiator can create a request. Ask admin to change roles.")
         return
     await state.clear()
@@ -285,7 +357,7 @@ async def newpay_start(message: Message, state: FSMContext) -> None:
 
 @router.message(PaymentForm.amount)
 async def newpay_amount(message: Message, state: FSMContext) -> None:
-    txt = (message.text or "").replace(",", ".").strip()
+    txt = ((message.text or "").replace(",", ".").strip())
     try:
         amount = float(txt)
         if amount <= 0:
@@ -303,7 +375,7 @@ async def cb_pick_category(call: CallbackQuery, state: FSMContext) -> None:
     label = get_category_label_by_code(code)
     await state.update_data(category=label)
     await state.set_state(PaymentForm.method_select)
-    await call.message.edit_text(f"Category: {label}\n\nSelect payment method:", reply_markup=methods_kb(include_nav=True))
+    await call.message.edit_text(f"Category: {label}\n\nSelect payment method:", reply_markup=methods_kb())
     await call.answer()
 
 @router.callback_query(F.data.startswith("methodname:"))
@@ -330,7 +402,7 @@ async def newpay_description(message: Message, state: FSMContext) -> None:
         currency=CURRENCY,
         method=data["method"],
         description=desc,
-        category=data.get("category") or "📦 Operating Expenses (Other)"
+        category=(data.get("category") or "📦 Operating Expenses (Other)")
     )
     p = get_payment(pid)
 
@@ -371,7 +443,7 @@ async def cb_nav_back(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.edit_text("Select expense category:", reply_markup=category_kb())
     elif cur == PaymentForm.description.state:
         await state.set_state(PaymentForm.method_select)
-        await call.message.edit_text("Select payment method:", reply_markup=methods_kb(include_nav=True))
+        await call.message.edit_text("Select payment method:", reply_markup=methods_kb())
     else:
         await call.answer("Nothing to go back to.", show_alert=True)
         return
@@ -439,8 +511,17 @@ async def cb_reject(call: CallbackQuery) -> None:
     await call.message.edit_text(render_card(p))
     await call.answer("Rejected ❌")
 
+    # Notify initiator
     try:
         await call.bot.send_message(p["initiator_id"], f"❌ Request #PAY-{pid} rejected.")
+    except Exception:
+        pass
+
+    # Notify viewer (if distinct from approver and initiator)
+    try:
+        vid = roles.get("viewer_id")
+        if vid and vid not in (call.from_user.id, p["initiator_id"]):
+            await call.bot.send_message(vid, f"ℹ️ Payment rejected for review:\n{render_card(p)}")
     except Exception:
         pass
 

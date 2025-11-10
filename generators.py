@@ -227,6 +227,14 @@ def list_methods():
         cur.execute("SELECT id, name FROM methods ORDER BY id ASC")
         return cur.fetchall()
 
+# New: list only methods that are NOT in the whitelist
+def list_custom_methods():
+    with _conn() as con:
+        cur = con.cursor()
+        placeholders = ",".join(["?"] * len(ALLOWED_METHODS))
+        cur.execute(f"SELECT id, name FROM methods WHERE name NOT IN ({placeholders}) ORDER BY id ASC", ALLOWED_METHODS)
+        return cur.fetchall()
+
 def add_method(name: str):
     name = (name or "").strip()
     if not name:
@@ -248,6 +256,29 @@ def get_method_by_id(mid: int):
         cur.execute("SELECT id, name FROM methods WHERE id=?", (mid,))
         row = cur.fetchone()
         return {"id": row[0], "name": row[1]} if row else None
+
+# New: safe delete method with safeguards
+def delete_method(method_id: int):
+    """Delete a method by id if it's not whitelisted and not used by any payment.
+    Returns (ok: bool, message: str).
+    """
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("SELECT id, name FROM methods WHERE id=?", (method_id,))
+        row = cur.fetchone()
+        if not row:
+            return False, "Method not found"
+        mid, name = row[0], row[1]
+        if name in ALLOWED_METHODS:
+            return False, "Cannot delete system method"
+        # Check usage in payments
+        cur.execute("SELECT COUNT(*) FROM payments WHERE method=?", (name,))
+        cnt = cur.fetchone()[0]
+        if cnt and int(cnt) > 0:
+            return False, f"Method is in use by {cnt} payment(s)"
+        cur.execute("DELETE FROM methods WHERE id=?", (mid,))
+        con.commit()
+        return True, "Deleted"
 
 # ---------- PAYMENTS ----------
 def _now():
