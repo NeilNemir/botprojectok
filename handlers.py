@@ -49,7 +49,7 @@ def category_kb() -> InlineKeyboardMarkup:
 def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
     rows = []
     for mid, name in list_methods():
-        rows.append([InlineKeyboardButton(text=name, callback_data=f"methodid:{mid}")])
+        rows.append([InlineKeyboardButton(text=name, callback_data=f"methodname:{name}")])
     if include_nav:
         rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"),
                      InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")])

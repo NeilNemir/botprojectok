@@ -114,32 +114,29 @@ def _migrate_single_approver():
         con.commit()
 
 def _ensure_one_stage_schema():
-    """Migrate old two-stage schema to single-stage.
-    - add approved_by / approved_at if missing
-    - convert statuses PENDING_1/PENDING_2 -> PENDING
-    - fill approved_by/approved_at for APPROVED rows from *_1/*_2
-    """
+    """Migrate old two-stage schema to single-stage safely."""
     with _conn() as con:
         cur = con.cursor()
         cur.execute("PRAGMA table_info(payments)")
-        cols = [r[1] for r in cur.fetchall()]
+        cols = {r[1] for r in cur.fetchall()}
         # add new columns if not present
         if "approved_by" not in cols:
             cur.execute("ALTER TABLE payments ADD COLUMN approved_by INTEGER")
         if "approved_at" not in cols:
             cur.execute("ALTER TABLE payments ADD COLUMN approved_at TEXT")
         # statuses
-        cur.execute("UPDATE payments SET status='PENDING' WHERE status IN ('PENDING_1','PENDING_2')")
-        # backfill approved fields
-        # prefer 2nd stage if exists, else 1st
-        cur.execute(
-            """
-            UPDATE payments
-            SET approved_by = COALESCE(approved_by, COALESCE(approved_by_2, approved_by_1)),
-                approved_at = COALESCE(approved_at, COALESCE(approved_at_2, approved_at_1))
-            WHERE status='APPROVED'
-            """
-        )
+        if "status" in cols:
+            cur.execute("UPDATE payments SET status='PENDING' WHERE status IN ('PENDING_1','PENDING_2')")
+        # backfill approved fields only if legacy columns exist
+        has_by1 = "approved_by_1" in cols
+        has_by2 = "approved_by_2" in cols
+        has_at1 = "approved_at_1" in cols
+        has_at2 = "approved_at_2" in cols
+        if has_by1 or has_by2 or has_at1 or has_at2:
+            src_by = "approved_by_2" if has_by2 else ("approved_by_1" if has_by1 else None)
+            src_at = "approved_at_2" if has_at2 else ("approved_at_1" if has_at1 else None)
+            if src_by and src_at:
+                cur.execute(f"UPDATE payments SET approved_by = COALESCE(approved_by, {src_by}), approved_at = COALESCE(approved_at, {src_at}) WHERE status='APPROVED'")
         con.commit()
 
 def ensure_methods_whitelist(names: list[str]):
