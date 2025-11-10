@@ -11,6 +11,15 @@ def _conn():
     con.row_factory = sqlite3.Row
     return con
 
+def sync_methods_whitelist():
+    with _conn() as con:
+        cur = con.cursor()
+        for m in ALLOWED_METHODS:
+            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
+        placeholders = ",".join("?" for _ in ALLOWED_METHODS)
+        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({placeholders})", ALLOWED_METHODS)
+        con.commit()
+
 # ---------- INIT DB ----------
 def init_db():
     with _conn() as con:
@@ -70,11 +79,7 @@ def init_db():
     # ---- Миграции (добавляем category в payments, если нет) ----
     _ensure_payments_has_category()
     _ensure_one_stage_schema()
-    ensure_methods_whitelist(["Bank of Company", "USDT", "Cash"]) 
-    # ---- Миграция на одноэтапное согласование ----
-    _migrate_single_approver()
-    # ---- Гарантируем, что в methods только три допустимых пункта ----
-    _ensure_allowed_methods()
+    sync_methods_whitelist()
 
 def _ensure_payments_has_category():
     with _conn() as con:
@@ -168,6 +173,18 @@ def _ensure_allowed_methods():
             cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
         con.commit()
 
+def enforce_method_whitelist():
+    """Оставить только методы из ALLOWED_METHODS, остальные удалить. Добавить недостающие."""
+    with _conn() as con:
+        cur = con.cursor()
+        # Удалить всё лишнее
+        placeholders = ",".join(["?"] * len(ALLOWED_METHODS))
+        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({placeholders})", ALLOWED_METHODS)
+        # Добавить недостающие
+        for m in ALLOWED_METHODS:
+            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
+        con.commit()
+
 # ---------- CONFIG ----------
 def set_config(key: str, value):
     with _conn() as con:
@@ -236,19 +253,8 @@ def list_custom_methods():
         return cur.fetchall()
 
 def add_method(name: str):
-    name = (name or "").strip()
-    if not name:
-        return False, "Empty name"
-    with _conn() as con:
-        cur = con.cursor()
-        try:
-            cur.execute("INSERT INTO methods(name) VALUES (?)", (name,))
-            con.commit()
-            return True, cur.lastrowid
-        except sqlite3.IntegrityError:
-            cur.execute("SELECT id FROM methods WHERE name=?", (name,))
-            row = cur.fetchone()
-            return True, (row[0] if row else None)
+    # Отключено намеренно
+    return False, "Method creation disabled"
 
 def get_method_by_id(mid: int):
     with _conn() as con:
