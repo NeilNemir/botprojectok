@@ -3,7 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from handlers import router
-from generators import init_db, seed_approvers_if_empty
+from generators import init_db, seed_approver_if_empty
 
 # === ВАЖНО ===
 # Пока токен остаётся в коде (как и было). Позже вынесем в .env.
@@ -15,9 +15,10 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN env var is not set")
 
-# Согласующие по умолчанию (если в БД ещё пусто) — будут проставлены при старте
-DEFAULT_APPROVER1_ID = 5874817910
-DEFAULT_APPROVER2_ID = 8189816731
+# Согласующий по умолчанию (если в БД ещё пусто) — будет проставлен при старте
+DEFAULT_APPROVER_ID = 8189816731
+# Пользователь для ознакомления с оплатами
+DEFAULT_VIEWER_ID = 5874817910
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -25,8 +26,8 @@ async def main():
     # Инициализация БД + авто-миграции
     init_db()
 
-    # Если approver1/2 ещё не заданы — проставим дефолтные
-    seed_approvers_if_empty(DEFAULT_APPROVER1_ID, DEFAULT_APPROVER2_ID)
+    # Если approver ещё не задан — проставим дефолтный
+    seed_approver_if_empty(DEFAULT_APPROVER_ID, DEFAULT_VIEWER_ID)
 
     bot = Bot(token=BOT_TOKEN)
     me = await bot.get_me()

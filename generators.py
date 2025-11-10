@@ -4,6 +4,8 @@ from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "botdata.db")
 
+ALLOWED_METHODS = ["Bank of Company", "USDT", "Cash"]
+
 def _conn():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
@@ -37,11 +39,9 @@ def init_db():
             currency       TEXT NOT NULL,
             method         TEXT NOT NULL,
             description    TEXT NOT NULL,
-            status         TEXT NOT NULL, -- PENDING_1 | PENDING_2 | APPROVED | REJECTED
-            approved_by_1  INTEGER,
-            approved_at_1  TEXT,
-            approved_by_2  INTEGER,
-            approved_at_2  TEXT,
+            status         TEXT NOT NULL, -- PENDING | APPROVED | REJECTED
+            approved_by    INTEGER,
+            approved_at    TEXT,
             rejected_by    INTEGER,
             rejected_at    TEXT,
             group_chat_id  INTEGER,
@@ -54,7 +54,7 @@ def init_db():
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             payment_id  INTEGER NOT NULL,
             actor_id    INTEGER NOT NULL,
-            action      TEXT NOT NULL,      -- CREATE | APPROVE_1 | APPROVE_2 | REJECT | TO_PENDING_1 | POSTED
+            action      TEXT NOT NULL,      -- CREATE | APPROVE | REJECT | TO_PENDING | POSTED
             ts          TEXT NOT NULL,
             payload     TEXT,
             FOREIGN KEY (payment_id) REFERENCES payments(id)
@@ -64,11 +64,17 @@ def init_db():
         cur.execute("SELECT COUNT(*) FROM methods")
         if cur.fetchone()[0] == 0:
             cur.executemany("INSERT INTO methods(name) VALUES(?)",
-                            [("Bank of Company",), ("USDT",), ("Cash",)])
+                            [(m,) for m in ALLOWED_METHODS])
         con.commit()
 
     # ---- Миграции (добавляем category в payments, если нет) ----
     _ensure_payments_has_category()
+    _ensure_one_stage_schema()
+    ensure_methods_whitelist(["Bank of Company", "USDT", "Cash"]) 
+    # ---- Миграция на одноэтапное согласование ----
+    _migrate_single_approver()
+    # ---- Гарантируем, что в methods только три допустимых пункта ----
+    _ensure_allowed_methods()
 
 def _ensure_payments_has_category():
     with _conn() as con:
@@ -78,6 +84,92 @@ def _ensure_payments_has_category():
         if "category" not in cols:
             cur.execute("ALTER TABLE payments ADD COLUMN category TEXT")
             con.commit()
+
+def _migrate_single_approver():
+    """Миграция: добавляем approved_by/approved_at и приводим статусы к PENDING/APPROVED/REJECTED.
+    Конвертируем старые записи:
+    - PENDING_1/PENDING_2 -> PENDING
+    - APPROVED с approved_by_2 -> APPROVED и переносим в approved_by/approved_at
+    """
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(payments)")
+        cols = [r[1] for r in cur.fetchall()]
+        if "approved_by" not in cols:
+            cur.execute("ALTER TABLE payments ADD COLUMN approved_by INTEGER")
+        if "approved_at" not in cols:
+            cur.execute("ALTER TABLE payments ADD COLUMN approved_at TEXT")
+        # Нормализуем статусы
+        cur.execute("UPDATE payments SET status='PENDING' WHERE status IN ('PENDING_1','PENDING_2')")
+        # Переносим финальные апрувы
+        # approved_by_2/approved_at_2 при наличии -> approved_by/approved_at
+        try:
+            cur.execute(
+                "UPDATE payments SET approved_by=approved_by_2, approved_at=approved_at_2 "
+                "WHERE status='APPROVED' AND approved_by_2 IS NOT NULL"
+            )
+        except Exception:
+            # старых колонок может не быть — игнорируем
+            pass
+        con.commit()
+
+def _ensure_one_stage_schema():
+    """Migrate old two-stage schema to single-stage.
+    - add approved_by / approved_at if missing
+    - convert statuses PENDING_1/PENDING_2 -> PENDING
+    - fill approved_by/approved_at for APPROVED rows from *_1/*_2
+    """
+    with _conn() as con:
+        cur = con.cursor()
+        cur.execute("PRAGMA table_info(payments)")
+        cols = [r[1] for r in cur.fetchall()]
+        # add new columns if not present
+        if "approved_by" not in cols:
+            cur.execute("ALTER TABLE payments ADD COLUMN approved_by INTEGER")
+        if "approved_at" not in cols:
+            cur.execute("ALTER TABLE payments ADD COLUMN approved_at TEXT")
+        # statuses
+        cur.execute("UPDATE payments SET status='PENDING' WHERE status IN ('PENDING_1','PENDING_2')")
+        # backfill approved fields
+        # prefer 2nd stage if exists, else 1st
+        cur.execute(
+            """
+            UPDATE payments
+            SET approved_by = COALESCE(approved_by, COALESCE(approved_by_2, approved_by_1)),
+                approved_at = COALESCE(approved_at, COALESCE(approved_at_2, approved_at_1))
+            WHERE status='APPROVED'
+            """
+        )
+        con.commit()
+
+def ensure_methods_whitelist(names: list[str]):
+    """Ensure that only the provided method names exist in the methods table.
+    Adds missing ones and removes any others.
+    """
+    keep = set([n.strip() for n in names if n and n.strip()])
+    if not keep:
+        return
+    with _conn() as con:
+        cur = con.cursor()
+        # Insert missing
+        for name in keep:
+            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (name,))
+        # Delete extras
+        qmarks = ",".join("?" for _ in keep)
+        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({qmarks})", tuple(keep))
+        con.commit()
+
+def _ensure_allowed_methods():
+    """Оставляем только три допустимых метода и добавляем отсутствующие."""
+    with _conn() as con:
+        cur = con.cursor()
+        # Удаляем лишние методы
+        placeholders = ",".join(["?"] * len(ALLOWED_METHODS))
+        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({placeholders})", ALLOWED_METHODS)
+        # Добавляем отсутствующие
+        for m in ALLOWED_METHODS:
+            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
+        con.commit()
 
 # ---------- CONFIG ----------
 def set_config(key: str, value):
@@ -113,21 +205,23 @@ def set_group_id(chat_id: int):
 def get_roles():
     return {
         "initiator_id": get_config("initiator_id", None, int),
-        "approver1_id": get_config("approver1_id", None, int),
-        "approver2_id": get_config("approver2_id", None, int),
+        "approver_id": get_config("approver_id", None, int),
+        "viewer_id": get_config("viewer_id", None, int),
     }
 
 def set_all_me(user_id: int):
     set_config("initiator_id", user_id)
-    set_config("approver1_id", user_id)
-    set_config("approver2_id", user_id)
+    set_config("approver_id", user_id)
+    set_config("viewer_id", user_id)
 
 def set_initiator(user_id: int):
     set_config("initiator_id", user_id)
 
-def set_approvers(ap1_id: int, ap2_id: int):
-    set_config("approver1_id", ap1_id)
-    set_config("approver2_id", ap2_id)
+def set_approver(approver_id: int):
+    set_config("approver_id", approver_id)
+
+def set_viewer(viewer_id: int):
+    set_config("viewer_id", viewer_id)
 
 # ---------- METHODS ----------
 def list_methods():
@@ -168,7 +262,7 @@ def create_payment(initiator_id: int, amount: float, currency: str, method: str,
         cur = con.cursor()
         cur.execute("""
             INSERT INTO payments (created_at, initiator_id, amount, currency, method, description, status, category)
-            VALUES (?, ?, ?, ?, ?, ?, 'PENDING_1', ?)
+            VALUES (?, ?, ?, ?, ?, ?, 'PENDING', ?)
         """, (_now(), initiator_id, amount, currency, method, description, category))
         pid = cur.lastrowid
         cur.execute("""
@@ -197,50 +291,26 @@ def get_payment(payment_id: int) -> dict | None:
         row = cur.fetchone()
         return dict(row) if row else None
 
-def approve_stage1(payment_id: int, approver_id: int):
+def approve_payment(payment_id: int, approver_id: int):
     with _conn() as con:
         cur = con.cursor()
-        cur.execute("SELECT status, approved_by_1 FROM payments WHERE id=?", (payment_id,))
+        cur.execute("SELECT status, approved_by FROM payments WHERE id=?", (payment_id,))
         row = cur.fetchone()
         if not row:
             return False, "Payment not found"
-        status, approved_by_1 = row["status"], row["approved_by_1"]
-        if status != "PENDING_1":
+        status, approved_by = row["status"], row["approved_by"]
+        if status != "PENDING":
             return False, f"Wrong status: {status}"
-        if approved_by_1 is not None:
-            return False, "Already approved (1/2)"
+        if approved_by is not None:
+            return False, "Already approved"
         cur.execute("""
             UPDATE payments
-            SET status='PENDING_2', approved_by_1=?, approved_at_1=?
+            SET status='APPROVED', approved_by=?, approved_at=?
             WHERE id=?
         """, (approver_id, _now(), payment_id))
         cur.execute("""
             INSERT INTO audit_log (payment_id, actor_id, action, ts, payload)
-            VALUES (?, ?, 'APPROVE_1', ?, NULL)
-        """, (payment_id, approver_id, _now()))
-        con.commit()
-        return True, "OK"
-
-def approve_stage2(payment_id: int, approver_id: int):
-    with _conn() as con:
-        cur = con.cursor()
-        cur.execute("SELECT status, approved_by_2 FROM payments WHERE id=?", (payment_id,))
-        row = cur.fetchone()
-        if not row:
-            return False, "Payment not found"
-        status, approved_by_2 = row["status"], row["approved_by_2"]
-        if status != "PENDING_2":
-            return False, f"Wrong status: {status}"
-        if approved_by_2 is not None:
-            return False, "Already approved (2/2)"
-        cur.execute("""
-            UPDATE payments
-            SET status='APPROVED', approved_by_2=?, approved_at_2=?
-            WHERE id=?
-        """, (approver_id, _now(), payment_id))
-        cur.execute("""
-            INSERT INTO audit_log (payment_id, actor_id, action, ts, payload)
-            VALUES (?, ?, 'APPROVE_2', ?, NULL)
+            VALUES (?, ?, 'APPROVE', ?, NULL)
         """, (payment_id, approver_id, _now()))
         con.commit()
         return True, "OK"
@@ -275,7 +345,7 @@ def list_pending(limit: int = 20):
         cur.execute("""
             SELECT id, created_at, initiator_id, amount, currency, method, description, status, category
             FROM payments
-            WHERE status IN ('PENDING_1','PENDING_2')
+            WHERE status = 'PENDING'
             ORDER BY id DESC
             LIMIT ?
         """, (limit,))
@@ -299,7 +369,7 @@ def get_payment_compact(payment_id: int):
         cur = con.cursor()
         cur.execute("""
             SELECT id, created_at, initiator_id, amount, currency, method, description, status,
-                   approved_by_1, approved_at_1, approved_by_2, approved_at_2, rejected_by, rejected_at, category
+                   approved_by, approved_at, rejected_by, rejected_at, category
             FROM payments WHERE id=?
         """, (payment_id,))
         row = cur.fetchone()
@@ -318,14 +388,14 @@ def export_payments_csv(path: str):
         for r in cur.fetchall():
             writer.writerow([r[c] for c in cols])
     return path
-def seed_approvers_if_empty(ap1_id: int, ap2_id: int):
+def seed_approver_if_empty(approver_id: int, viewer_id: int):
     """
-    Если в БД не заданы approver1_id/approver2_id — проставим дефолты.
+    Если в БД не заданы approver_id/viewer_id — проставим дефолты.
     Не трогаем, если уже есть значения.
     """
-    current_ap1 = get_config("approver1_id", None, int)
-    current_ap2 = get_config("approver2_id", None, int)
-    if current_ap1 is None:
-        set_config("approver1_id", ap1_id)
-    if current_ap2 is None:
-        set_config("approver2_id", ap2_id)
+    current_approver = get_config("approver_id", None, int)
+    current_viewer = get_config("viewer_id", None, int)
+    if current_approver is None:
+        set_config("approver_id", approver_id)
+    if current_viewer is None:
+        set_config("viewer_id", viewer_id)

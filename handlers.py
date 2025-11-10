@@ -6,10 +6,10 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 from generators import (
     get_group_id, set_group_id, get_roles, set_all_me, set_initiator,
-    list_methods, add_method, get_method_by_id,
-    create_payment, set_group_message, get_payment, approve_stage1, approve_stage2, reject_payment,
+    list_methods, get_method_by_id,
+    create_payment, set_group_message, get_payment, approve_payment, reject_payment,
     list_pending, list_user_payments, get_payment_compact, export_payments_csv,
-    set_approvers,
+    set_approver, set_viewer,
 )
 
 router = Router()
@@ -50,7 +50,6 @@ def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
     rows = []
     for mid, name in list_methods():
         rows.append([InlineKeyboardButton(text=name, callback_data=f"methodid:{mid}")])
-    rows.append([InlineKeyboardButton(text="➕ Add method", callback_data="method_add")])
     if include_nav:
         rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"),
                      InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")])
@@ -59,8 +58,8 @@ def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
 def kb_group_approve(pid: int) -> InlineKeyboardMarkup:
     # Единая кнопка Approve без привязки к этапу + Reject
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{pid}"),
-        InlineKeyboardButton(text="❌ Reject", callback_data=f"reject:{pid}")
+        InlineKeyboardButton(text="🔋 Approve", callback_data=f"approve:{pid}"),
+        InlineKeyboardButton(text="🪫 Reject", callback_data=f"reject:{pid}")
     ]])
 
 # ========= Утилиты =========
@@ -85,10 +84,8 @@ def render_card(p: dict) -> str:
         "",
         f"Created: {p['created_at']}",
     ]
-    if p.get("approved_by_1"):
-        lines.append(f"1/2: ✅ {p['approved_by_1']} at {p.get('approved_at_1','')}")
-    if p.get("approved_by_2"):
-        lines.append(f"2/2: ✅ {p['approved_by_2']} at {p.get('approved_at_2','')}")
+    if p.get("approved_by"):
+        lines.append(f"✅ Approved by: {p['approved_by']} at {p.get('approved_at','')}")
     if p.get("rejected_by"):
         lines.append(f"Rejected by: {p['rejected_by']} at {p.get('rejected_at','')}")
     return "\n".join(lines)
@@ -103,7 +100,7 @@ def render_line(row) -> str:
 async def cmd_start(message: Message) -> None:
     await message.answer(
         "✅ Bot online.\n"
-        "Commands: /ping, /newpay, /methods, /pending, /my, /pay <id>, /export_csv, /whoami, /roles, /set_all_me, /set_initiator <id>, /set_approvers <ap1> <ap2>, /setup_here (in group), /ver"
+        "Commands: /ping, /newpay, /methods, /pending, /my, /pay <id>, /export_csv, /whoami, /roles, /set_all_me, /set_initiator <id>, /set_approver <id>, /set_viewer <id>, /setup_here (in group), /ver"
     )
 
 @router.message(Command("ver"))
@@ -125,15 +122,15 @@ async def cmd_roles(message: Message) -> None:
     await message.answer(
         "Roles:\n"
         f"- initiator_id: {roles['initiator_id']}\n"
-        f"- approver1_id: {roles['approver1_id']}\n"
-        f"- approver2_id: {roles['approver2_id']}\n"
+        f"- approver_id: {roles['approver_id']}\n"
+        f"- viewer_id: {roles['viewer_id']}\n"
         f"- group_id: {gid}"
     )
 
 @router.message(Command("set_all_me"))
 async def cmd_set_all_me_cmd(message: Message) -> None:
     set_all_me(message.from_user.id)
-    await message.answer("✅ Saved to DB: you are initiator + approver1 + approver2. Use /roles to check.")
+    await message.answer("✅ Saved to DB: you are initiator + approver + viewer. Use /roles to check.")
 
 @router.message(Command("set_initiator"))
 async def cmd_set_initiator_cmd(message: Message) -> None:
@@ -160,26 +157,45 @@ async def cmd_set_initiator_cmd(message: Message) -> None:
     set_initiator(new_init)
     await message.answer(f"✅ Initiator set to {new_init}")
 
-@router.message(Command("set_approvers"))
-async def cmd_set_approvers_cmd(message: Message) -> None:
+@router.message(Command("set_approver"))
+async def cmd_set_approver_cmd(message: Message) -> None:
     """
-    Использование: /set_approvers <ap1_id> <ap2_id>
+    Использование: /set_approver <id>
     Менять может текущий initiator.
     """
     roles = get_roles()
     if not roles["initiator_id"] or message.from_user.id != roles["initiator_id"]:
-        await message.answer("Only initiator can change approvers. Ask admin to change roles.")
+        await message.answer("Only initiator can change approver. Ask admin to change roles.")
         return
 
     parts = (message.text or "").split()
-    if len(parts) != 3 or not (parts[1].isdigit() and parts[2].isdigit()):
-        await message.answer("Usage: /set_approvers <approver1_id> <approver2_id>")
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /set_approver <approver_id>")
         return
 
-    ap1 = int(parts[1])
-    ap2 = int(parts[2])
-    set_approvers(ap1, ap2)
-    await message.answer(f"✅ Approvers set:\n- approver1_id = {ap1}\n- approver2_id = {ap2}")
+    approver_id = int(parts[1])
+    set_approver(approver_id)
+    await message.answer(f"✅ Approver set to {approver_id}")
+
+@router.message(Command("set_viewer"))
+async def cmd_set_viewer_cmd(message: Message) -> None:
+    """
+    Использование: /set_viewer <id>
+    Менять может текущий initiator.
+    """
+    roles = get_roles()
+    if not roles["initiator_id"] or message.from_user.id != roles["initiator_id"]:
+        await message.answer("Only initiator can change viewer. Ask admin to change roles.")
+        return
+
+    parts = (message.text or "").split()
+    if len(parts) != 2 or not parts[1].isdigit():
+        await message.answer("Usage: /set_viewer <viewer_id>")
+        return
+
+    viewer_id = int(parts[1])
+    set_viewer(viewer_id)
+    await message.answer(f"✅ Viewer set to {viewer_id}")
 
 async def _bind_group(message: Message) -> None:
     if message.chat.type not in ("group", "supergroup"):
@@ -249,7 +265,6 @@ class PaymentForm(StatesGroup):
     amount = State()
     category_select = State()
     method_select = State()
-    method_add = State()
     description = State()
 
 @router.message(Command("newpay"))
@@ -291,35 +306,13 @@ async def cb_pick_category(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.edit_text(f"Category: {label}\n\nSelect payment method:", reply_markup=methods_kb(include_nav=True))
     await call.answer()
 
-@router.callback_query(F.data == "method_add")
-async def cb_add_method(call: CallbackQuery, state: FSMContext) -> None:
-    await state.set_state(PaymentForm.method_add)
-    await call.message.edit_text("Send new payment method name:", reply_markup=kb_nav(back=True))
-    await call.answer()
-
-@router.message(PaymentForm.method_add)
-async def newpay_method_add_msg(message: Message, state: FSMContext) -> None:
-    name = (message.text or "").strip()
-    if not name:
-        await message.answer("Method name cannot be empty. Try again:", reply_markup=kb_nav(back=True))
-        return
-    ok, mid = add_method(name)
-    if not ok:
-        await message.answer("Failed to add method. Try another name.", reply_markup=kb_nav(back=True))
-        return
-    method_name = get_method_by_id(int(mid))["name"]
-    await state.update_data(method=method_name)
-    await state.set_state(PaymentForm.description)
-    await message.answer(f"Method added: {method_name}\nNow enter description (any language):", reply_markup=kb_nav(back=True))
-
-@router.callback_query(F.data.startswith("methodid:"))
+@router.callback_query(F.data.startswith("methodname:"))
 async def cb_pick_method(call: CallbackQuery, state: FSMContext) -> None:
-    mid = int(call.data.split(":")[1])
-    row = get_method_by_id(mid)
-    if not row:
+    method = call.data.split(":", 1)[1]
+    # Валидация против фиксированного набора
+    if method not in {"Bank of Company", "USDT", "Cash"}:
         await call.answer("Unknown method", show_alert=True)
         return
-    method = row["name"]
     await state.update_data(method=method)
     await state.set_state(PaymentForm.description)
     await call.message.edit_text(f"Method: {method}\nNow enter description (any language):", reply_markup=kb_nav(back=True))
@@ -376,9 +369,6 @@ async def cb_nav_back(call: CallbackQuery, state: FSMContext) -> None:
     elif cur == PaymentForm.method_select.state:
         await state.set_state(PaymentForm.category_select)
         await call.message.edit_text("Select expense category:", reply_markup=category_kb())
-    elif cur == PaymentForm.method_add.state:
-        await state.set_state(PaymentForm.method_select)
-        await call.message.edit_text("Select payment method:", reply_markup=methods_kb(include_nav=True))
     elif cur == PaymentForm.description.state:
         await state.set_state(PaymentForm.method_select)
         await call.message.edit_text("Select payment method:", reply_markup=methods_kb(include_nav=True))
@@ -389,13 +379,13 @@ async def cb_nav_back(call: CallbackQuery, state: FSMContext) -> None:
 
 # ========= CALLBACKS ГРУППЫ (Approve/Reject) =========
 @router.callback_query(F.data.startswith("approve:"))
-async def cb_approve_flexible(call: CallbackQuery) -> None:
+async def cb_approve_payment(call: CallbackQuery) -> None:
     pid = int(call.data.split(":")[1])
 
     roles = get_roles()
-    approvers = set(filter(None, [roles["approver1_id"], roles["approver2_id"]]))
-    if call.from_user.id not in approvers:
-        await call.answer("You are not an approver", show_alert=True)
+    # Только указанный approver может согласовывать
+    if call.from_user.id != roles["approver_id"]:
+        await call.answer("You are not the designated approver", show_alert=True)
         return
 
     p = get_payment(pid)
@@ -403,46 +393,41 @@ async def cb_approve_flexible(call: CallbackQuery) -> None:
         await call.answer("Payment not found", show_alert=True)
         return
 
-    # Гибкая логика:
-    # Если ещё PENDING_1 — любая сторона может сделать первый апрув.
-    # Если уже есть approved_by_1 — второй апрув может сделать только другой человек.
-    if p["status"] == "PENDING_1":
-        # Первый апрув
-        ok, msg = approve_stage1(pid, approver_id=call.from_user.id)
-        if not ok:
-            await call.answer(msg, show_alert=True)
-            return
-        p = get_payment(pid)
-        await call.message.edit_text(render_card(p), reply_markup=kb_group_approve(pid))
-        await call.answer("Approved (1/2) ✅")
+    # Одноэтапное согласование
+    if p["status"] != "PENDING":
+        await call.answer(f"Already finalized: {p['status']}", show_alert=True)
         return
 
-    if p["status"] == "PENDING_2":
-        if p.get("approved_by_1") == call.from_user.id:
-            await call.answer("You already approved as 1/2. The second approval must be by the other approver.", show_alert=True)
-            return
-        ok, msg = approve_stage2(pid, approver_id=call.from_user.id)
-        if not ok:
-            await call.answer(msg, show_alert=True)
-            return
-        p = get_payment(pid)
-        await call.message.edit_text(render_card(p))  # финал — без кнопок
-        await call.answer("Approved (2/2) ✅")
-        try:
-            await call.bot.send_message(p["initiator_id"], f"✅ Request #PAY-{pid} approved 2/2.")
-        except Exception:
-            pass
+    ok, msg = approve_payment(pid, approver_id=call.from_user.id)
+    if not ok:
+        await call.answer(msg, show_alert=True)
         return
 
-    await call.answer(f"Already finalized: {p['status']}", show_alert=True)
+    p = get_payment(pid)
+    await call.message.edit_text(render_card(p))  # финал — без кнопок
+    await call.answer("Approved ✅")
+    
+    # Уведомляем инициатора
+    try:
+        await call.bot.send_message(p["initiator_id"], f"✅ Request #PAY-{pid} approved.")
+    except Exception:
+        pass
+    
+    # Уведомляем viewer для ознакомления
+    try:
+        if roles["viewer_id"] and roles["viewer_id"] != call.from_user.id:
+            await call.bot.send_message(roles["viewer_id"], f"ℹ️ Payment approved for review:\n{render_card(p)}")
+    except Exception:
+        pass
 
 @router.callback_query(F.data.startswith("reject:"))
 async def cb_reject(call: CallbackQuery) -> None:
     pid = int(call.data.split(":")[1])
 
     roles = get_roles()
-    if call.from_user.id not in (roles["approver1_id"], roles["approver2_id"]):
-        await call.answer("You are not an approver", show_alert=True)
+    # Только указанный approver может отклонять
+    if call.from_user.id != roles["approver_id"]:
+        await call.answer("You are not the designated approver", show_alert=True)
         return
 
     ok, msg = reject_payment(pid, approver_id=call.from_user.id)
@@ -468,5 +453,5 @@ async def any_message(message: Message) -> None:
     # В личке показываем подсказку
     await message.answer(
         "Use /ping or /newpay. Lists: /pending, /my, /pay <id>. Export: /export_csv. "
-        "Setup: /setup_here, /set_all_me, /set_initiator <id>, /set_approvers <ap1> <ap2>, /roles, /ver"
+        "Setup: /setup_here, /set_all_me, /set_initiator <id>, /set_approver <id>, /set_viewer <id>, /roles, /ver"
     )
