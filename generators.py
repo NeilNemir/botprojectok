@@ -4,21 +4,10 @@ from datetime import datetime
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "botdata.db")
 
-ALLOWED_METHODS = ["Bank of Company", "USDT", "Cash"]
-
 def _conn():
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con
-
-def sync_methods_whitelist():
-    with _conn() as con:
-        cur = con.cursor()
-        for m in ALLOWED_METHODS:
-            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
-        placeholders = ",".join("?" for _ in ALLOWED_METHODS)
-        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({placeholders})", ALLOWED_METHODS)
-        con.commit()
 
 # ---------- INIT DB ----------
 def init_db():
@@ -73,13 +62,11 @@ def init_db():
         cur.execute("SELECT COUNT(*) FROM methods")
         if cur.fetchone()[0] == 0:
             cur.executemany("INSERT INTO methods(name) VALUES(?)",
-                            [(m,) for m in ALLOWED_METHODS])
+                            [("Bank of Company",), ("USDT",), ("Cash",)])
         con.commit()
 
     # ---- Миграции (добавляем category в payments, если нет) ----
     _ensure_payments_has_category()
-    _ensure_one_stage_schema()
-    sync_methods_whitelist()
 
 def _ensure_payments_has_category():
     with _conn() as con:
@@ -89,101 +76,6 @@ def _ensure_payments_has_category():
         if "category" not in cols:
             cur.execute("ALTER TABLE payments ADD COLUMN category TEXT")
             con.commit()
-
-def _migrate_single_approver():
-    """Миграция: добавляем approved_by/approved_at и приводим статусы к PENDING/APPROVED/REJECTED.
-    Конвертируем старые записи:
-    - PENDING_1/PENDING_2 -> PENDING
-    - APPROVED с approved_by_2 -> APPROVED и переносим в approved_by/approved_at
-    """
-    with _conn() as con:
-        cur = con.cursor()
-        cur.execute("PRAGMA table_info(payments)")
-        cols = [r[1] for r in cur.fetchall()]
-        if "approved_by" not in cols:
-            cur.execute("ALTER TABLE payments ADD COLUMN approved_by INTEGER")
-        if "approved_at" not in cols:
-            cur.execute("ALTER TABLE payments ADD COLUMN approved_at TEXT")
-        # Нормализуем статусы
-        cur.execute("UPDATE payments SET status='PENDING' WHERE status IN ('PENDING_1','PENDING_2')")
-        # Переносим финальные апрувы
-        # approved_by_2/approved_at_2 при наличии -> approved_by/approved_at
-        try:
-            cur.execute(
-                "UPDATE payments SET approved_by=approved_by_2, approved_at=approved_at_2 "
-                "WHERE status='APPROVED' AND approved_by_2 IS NOT NULL"
-            )
-        except Exception:
-            # старых колонок может не быть — игнорируем
-            pass
-        con.commit()
-
-def _ensure_one_stage_schema():
-    """Migrate old two-stage schema to single-stage safely."""
-    with _conn() as con:
-        cur = con.cursor()
-        cur.execute("PRAGMA table_info(payments)")
-        cols = {r[1] for r in cur.fetchall()}
-        # add new columns if not present
-        if "approved_by" not in cols:
-            cur.execute("ALTER TABLE payments ADD COLUMN approved_by INTEGER")
-        if "approved_at" not in cols:
-            cur.execute("ALTER TABLE payments ADD COLUMN approved_at TEXT")
-        # statuses
-        if "status" in cols:
-            cur.execute("UPDATE payments SET status='PENDING' WHERE status IN ('PENDING_1','PENDING_2')")
-        # backfill approved fields only if legacy columns exist
-        has_by1 = "approved_by_1" in cols
-        has_by2 = "approved_by_2" in cols
-        has_at1 = "approved_at_1" in cols
-        has_at2 = "approved_at_2" in cols
-        if has_by1 or has_by2 or has_at1 or has_at2:
-            src_by = "approved_by_2" if has_by2 else ("approved_by_1" if has_by1 else None)
-            src_at = "approved_at_2" if has_at2 else ("approved_at_1" if has_at1 else None)
-            if src_by and src_at:
-                cur.execute(f"UPDATE payments SET approved_by = COALESCE(approved_by, {src_by}), approved_at = COALESCE(approved_at, {src_at}) WHERE status='APPROVED'")
-        con.commit()
-
-def ensure_methods_whitelist(names: list[str]):
-    """Ensure that only the provided method names exist in the methods table.
-    Adds missing ones and removes any others.
-    """
-    keep = set([n.strip() for n in names if n and n.strip()])
-    if not keep:
-        return
-    with _conn() as con:
-        cur = con.cursor()
-        # Insert missing
-        for name in keep:
-            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (name,))
-        # Delete extras
-        qmarks = ",".join("?" for _ in keep)
-        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({qmarks})", tuple(keep))
-        con.commit()
-
-def _ensure_allowed_methods():
-    """Оставляем только три допустимых метода и добавляем отсутствующие."""
-    with _conn() as con:
-        cur = con.cursor()
-        # Удаляем лишние методы
-        placeholders = ",".join(["?"] * len(ALLOWED_METHODS))
-        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({placeholders})", ALLOWED_METHODS)
-        # Добавляем отсутствующие
-        for m in ALLOWED_METHODS:
-            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
-        con.commit()
-
-def enforce_method_whitelist():
-    """Оставить только методы из ALLOWED_METHODS, остальные удалить. Добавить недостающие."""
-    with _conn() as con:
-        cur = con.cursor()
-        # Удалить всё лишнее
-        placeholders = ",".join(["?"] * len(ALLOWED_METHODS))
-        cur.execute(f"DELETE FROM methods WHERE name NOT IN ({placeholders})", ALLOWED_METHODS)
-        # Добавить недостающие
-        for m in ALLOWED_METHODS:
-            cur.execute("INSERT OR IGNORE INTO methods(name) VALUES(?)", (m,))
-        con.commit()
 
 # ---------- CONFIG ----------
 def set_config(key: str, value):
@@ -244,17 +136,20 @@ def list_methods():
         cur.execute("SELECT id, name FROM methods ORDER BY id ASC")
         return cur.fetchall()
 
-# New: list only methods that are NOT in the whitelist
-def list_custom_methods():
+def add_method(name: str):
+    name = (name or "").strip()
+    if not name:
+        return False, "Empty name"
     with _conn() as con:
         cur = con.cursor()
-        placeholders = ",".join(["?"] * len(ALLOWED_METHODS))
-        cur.execute(f"SELECT id, name FROM methods WHERE name NOT IN ({placeholders}) ORDER BY id ASC", ALLOWED_METHODS)
-        return cur.fetchall()
-
-def add_method(name: str):
-    # Отключено намеренно
-    return False, "Method creation disabled"
+        try:
+            cur.execute("INSERT INTO methods(name) VALUES (?)", (name,))
+            con.commit()
+            return True, cur.lastrowid
+        except sqlite3.IntegrityError:
+            cur.execute("SELECT id FROM methods WHERE name=?", (name,))
+            row = cur.fetchone()
+            return True, (row[0] if row else None)
 
 def get_method_by_id(mid: int):
     with _conn() as con:
@@ -262,29 +157,6 @@ def get_method_by_id(mid: int):
         cur.execute("SELECT id, name FROM methods WHERE id=?", (mid,))
         row = cur.fetchone()
         return {"id": row[0], "name": row[1]} if row else None
-
-# New: safe delete method with safeguards
-def delete_method(method_id: int):
-    """Delete a method by id if it's not whitelisted and not used by any payment.
-    Returns (ok: bool, message: str).
-    """
-    with _conn() as con:
-        cur = con.cursor()
-        cur.execute("SELECT id, name FROM methods WHERE id=?", (method_id,))
-        row = cur.fetchone()
-        if not row:
-            return False, "Method not found"
-        mid, name = row[0], row[1]
-        if name in ALLOWED_METHODS:
-            return False, "Cannot delete system method"
-        # Check usage in payments
-        cur.execute("SELECT COUNT(*) FROM payments WHERE method=?", (name,))
-        cnt = cur.fetchone()[0]
-        if cnt and int(cnt) > 0:
-            return False, f"Method is in use by {cnt} payment(s)"
-        cur.execute("DELETE FROM methods WHERE id=?", (mid,))
-        con.commit()
-        return True, "Deleted"
 
 # ---------- PAYMENTS ----------
 def _now():

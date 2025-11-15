@@ -1,14 +1,26 @@
 FROM python:3.12-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# System deps
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
-COPY . .
+# Install Python deps
+# If requirements.txt exists, use it; otherwise install known deps
+COPY requirements.txt /tmp/requirements.txt
+RUN if [ -s /tmp/requirements.txt ]; then \
+      pip install --no-cache-dir -r /tmp/requirements.txt; \
+    else \
+      pip install --no-cache-dir aiogram python-dotenv gspread google-auth; \
+    fi
 
-CMD ["python", "run.py"]
+# Copy app
+COPY . /app
+
+# Default command
+CMD ["python", "-u", "run.py"]

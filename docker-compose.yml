@@ -5,6 +5,12 @@ services:
     restart: unless-stopped
     environment:
       - BOT_TOKEN=${BOT_TOKEN}
+      - GSHEET_ID=${GSHEET_ID}
+      - GSHEET_TAB=${GSHEET_TAB}
+      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+    volumes:
+      - ./botdata.db:/app/botdata.db
+      - ./credentials.json:/app/credentials.json:ro
     networks:
       - bots
 

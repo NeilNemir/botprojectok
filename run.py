@@ -3,7 +3,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from handlers import router
-from generators import init_db, seed_approver_if_empty, get_group_id, set_group_id
+from generators import init_db, seed_approver_if_empty
 
 # === ВАЖНО ===
 # Пока токен остаётся в коде (как и было). Позже вынесем в .env.
@@ -19,8 +19,6 @@ if not BOT_TOKEN:
 DEFAULT_APPROVER_ID = 8189816731
 # Пользователь для ознакомления с оплатами
 DEFAULT_VIEWER_ID = 5874817910
-# Группа по умолчанию (если не задана) — сюда будут публиковаться заявки
-DEFAULT_GROUP_ID = -5098309551
 
 async def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -28,13 +26,8 @@ async def main():
     # Инициализация БД + авто-миграции
     init_db()
 
-    # Если approver/viewer ещё не заданы — проставим дефолтные
+    # Если approver ещё не задан — проставим дефолтный
     seed_approver_if_empty(DEFAULT_APPROVER_ID, DEFAULT_VIEWER_ID)
-
-    # Если группа ещё не задана — установим дефолтную
-    if get_group_id() is None:
-        set_group_id(DEFAULT_GROUP_ID)
-        logging.info(f"📌 Group id seeded: {DEFAULT_GROUP_ID}")
 
     bot = Bot(token=BOT_TOKEN)
     me = await bot.get_me()

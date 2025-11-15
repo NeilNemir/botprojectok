@@ -1,1 +1,5 @@
-aiogram==3.21.0
+aiogram==3.4.1
+# Google Sheets logging
+gspread==5.12.0
+google-auth==2.35.0
+python-dotenv==1.0.1

@@ -33,7 +33,7 @@ class TestPaymentsFlow(unittest.TestCase):
         # Second approval attempt should fail
         ok2, msg2 = approve_payment(pid, approver_id=222)
         self.assertFalse(ok2)
-        self.assertTrue(('Wrong status' in msg2) or ('Already approved' in msg2), msg2)
+        self.assertIn('Wrong status', msg2) or self.assertIn('Already approved', msg2)
 
     def test_reject_flow(self):
         pid = create_payment(initiator_id=111, amount=750, currency='THB', method='Bank of Company', description='Reject me', category='Cat')

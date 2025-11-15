@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.git
+.gitignore
+README*
+.benchmarks/
+.tests/
+.cache/
+.mypy_cache/
+.vscode/
+*.log
+botdata.db  # we mount it, not copy
+credentials.json  # mounted as secret, avoid baking into image
