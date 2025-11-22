@@ -449,7 +449,6 @@ async def cb_approve_staged(call: CallbackQuery) -> None:
     if not staged:
         await call.answer("Staged data missing", show_alert=True)
         return
-    # create approved payment directly (skip PENDING)
     pid = create_approved_payment(
         initiator_id=staged['initiator_id'],
         approver_id=call.from_user.id,
@@ -461,6 +460,7 @@ async def cb_approve_staged(call: CallbackQuery) -> None:
     )
     pop_staged(temp_id)
     p = get_payment(pid)
+    # Try to update caption/text with final card (may fail for some media types)
     try:
         await call.message.edit_caption(render_card(p))
     except Exception:
@@ -468,6 +468,13 @@ async def cb_approve_staged(call: CallbackQuery) -> None:
             await call.message.edit_text(render_card(p))
         except Exception:
             pass
+    # Additionally send a new separate message with full data so it is always visible even if caption edit fails or only photo shown
+    try:
+        gid = get_group_id()
+        if gid:
+            await call.bot.send_message(gid, render_card(p))
+    except Exception:
+        pass
     await call.answer("Approved ✅")
     try:
         log_approval_to_sheet(p)
@@ -485,20 +492,34 @@ async def cb_reject_staged(call: CallbackQuery) -> None:
         await call.answer("Not approver", show_alert=True)
         return
     temp_id = int(call.data.split(":")[1])
-    staged = pop_staged(temp_id)
+    staged = get_staged(temp_id)
     if not staged:
         await call.answer("Nothing to discard", show_alert=True)
         return
+    # Prepare a full info message before removing staged
+    full_info = (
+        f"#PAY-STAGED-{temp_id}\n• {fmt_amount(staged['amount'])} {staged['currency']}\n"\
+        f"• {staged['method']}\n• {staged['category']}\n\n"\
+        f"• Description: {staged['description']}\n\nStatus: REJECTED (not saved)\nInitiator: {staged['initiator_id']}\nRejected by: {call.from_user.id}"
+    )
+    pop_staged(temp_id)
     try:
-        await call.message.edit_caption("Staged request discarded.")
+        await call.message.edit_caption("Staged request rejected.")
     except Exception:
         try:
-            await call.message.edit_text("Staged request discarded.")
+            await call.message.edit_text("Staged request rejected.")
         except Exception:
             pass
+    # Send separate full data message for history
+    try:
+        gid = get_group_id()
+        if gid:
+            await call.bot.send_message(gid, full_info)
+    except Exception:
+        pass
     await call.answer("Discarded ❌")
     try:
-        await call.bot.send_message(staged['initiator_id'], "❌ Your staged request was discarded (not saved).")
+        await call.bot.send_message(staged['initiator_id'], "❌ Your staged request was rejected (not saved).")
     except Exception:
         pass
 

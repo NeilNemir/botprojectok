@@ -1,0 +1,6 @@
+requirements.txt
+pytest
+
+tests/test_smoke.py
+def test_hello_world():
+    assert "hello world" == "hello world"

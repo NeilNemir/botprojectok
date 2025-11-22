@@ -20,4 +20,21 @@ services:
       - ./logs:/app/logs
       - ./data:/app/data
       - ./credentials.json:/app/credentials.json:ro
+      - ./backups:/app/backups
+    healthcheck:
+      test: ["CMD", "bash", "-c", "curl -s -f https://api.telegram.org/bot$BOT_TOKEN/getMe > /dev/null"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+  backup:
+    image: bash:5
+    container_name: botprojectok_backup
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data:ro
+      - ./backups:/app/backups
+      - ./credentials.json:/app/credentials.json:ro
+      - ./scripts:/app/scripts:ro
+    entrypoint: ["bash", "-c", "while true; do /app/scripts/backup.sh; sleep 86400; done"]
 
