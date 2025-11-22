@@ -4,7 +4,7 @@ from generators import init_db, list_methods, add_method, delete_method, create_
 
 DB_FILE = os.path.join(os.path.dirname(__file__), '..', 'botdata.db')
 
-SYSTEM_METHODS = {"Bank of Company", "USDT", "Cash"}
+SYSTEM_METHODS = {"Bank", "USDT", "Cash"}
 
 class TestMethodDeletion(unittest.TestCase):
     def setUp(self):

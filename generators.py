@@ -77,7 +77,7 @@ def init_db() -> None:
         # seed system methods if empty
         cur.execute("SELECT COUNT(*) AS cnt FROM methods")
         if cur.fetchone()[0] == 0:
-            cur.executemany("INSERT INTO methods(name) VALUES (?)", [("Bank of Company",), ("USDT",), ("Cash",)])
+            cur.executemany("INSERT INTO methods(name) VALUES (?)", [("Bank",), ("USDT",), ("Cash",)])
         con.commit()
     try:
         ensure_methods_whitelist()
@@ -208,7 +208,7 @@ def is_initiator(user_id: int) -> bool:
     return int(user_id) in set(get_initiators())
 
 # --- METHODS ---
-ALLOWED_METHODS = ["Bank of Company", "USDT", "Cash"]
+ALLOWED_METHODS = ["Bank", "USDT", "Cash"]
 
 
 def ensure_methods_whitelist():

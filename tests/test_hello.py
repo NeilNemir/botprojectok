@@ -1,5 +1,3 @@
-pytest==7.0.0
-
 def test_hello():
     assert 1 + 1 == 2
 

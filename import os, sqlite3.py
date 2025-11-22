@@ -1,7 +1,7 @@
 import os, sqlite3
 
 DB = os.path.join(os.path.dirname(__file__), "botdata.db")
-ALLOWED = ('Bank of Company','USDT','Cash')
+ALLOWED = ('Bank','USDT','Cash')
 
 if not os.path.exists(DB):
     print("DB does not exist.")

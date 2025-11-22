@@ -42,7 +42,7 @@ class TestPaymentsFlow(unittest.TestCase):
         self.assertTrue('Wrong status' in msg2 or 'Already approved' in msg2)
 
     def test_reject_flow_legacy(self):
-        pid = create_payment(initiator_id=111, amount=750, currency='THB', method='Bank of Company', description='Reject me', category='Cat')
+        pid = create_payment(initiator_id=111, amount=750, currency='THB', method='Bank', description='Reject me', category='Cat')
         ok, msg = reject_payment(pid, approver_id=222)
         self.assertTrue(ok, msg)
         p = get_payment(pid)

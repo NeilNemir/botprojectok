@@ -9,7 +9,7 @@ from generators import (
     list_methods, create_approved_payment, get_payment,
     list_pending, list_user_payments, get_payment_compact, export_payments_csv,
     set_approver, set_viewer,
-    get_config,
+    get_config, set_group_message
 )
 from sheet_logger import log_approval_to_sheet
 from memory_store import put_staged, pop_staged, get_staged
@@ -50,7 +50,7 @@ def category_kb() -> InlineKeyboardMarkup:
 
 def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
     rows = []
-    allowed = {"Bank of Company", "USDT", "Cash"}
+    allowed = {"Bank", "USDT", "Cash"}
     for mid, name in list_methods():
         if name in allowed:
             rows.append([InlineKeyboardButton(text=name, callback_data=f"methodid:{mid}")])
@@ -95,6 +95,35 @@ def render_card(p: dict) -> str:
     if p.get("rejected_by"):
         lines.append(f"Rejected by: {p['rejected_by']} at {p.get('rejected_at','')}")
     return "\n".join(lines)
+
+# --- helper for unified edit (caption or text) ---
+async def _safe_edit_final(call_message, new_text: str):
+    """Пытаемся сначала изменить caption (если медиа), затем текст. Удаляем клавиатуру.
+    Возвращает True если получилось, иначе False."""
+    # Try message-bound convenience methods
+    try:
+        await call_message.edit_caption(caption=new_text, reply_markup=None)
+        return True
+    except Exception as e:
+        print(f"[edit_caption (message) fail] {e}")
+    # Try bot-level edit caption
+    try:
+        await call_message.bot.edit_message_caption(chat_id=call_message.chat.id, message_id=call_message.message_id, caption=new_text, reply_markup=None)
+        return True
+    except Exception as e:
+        print(f"[edit_caption (bot) fail] {e}")
+    # Try text edits
+    try:
+        await call_message.edit_text(text=new_text, reply_markup=None)
+        return True
+    except Exception as e:
+        print(f"[edit_text (message) fail] {e}")
+    try:
+        await call_message.bot.edit_message_text(chat_id=call_message.chat.id, message_id=call_message.message_id, text=new_text, reply_markup=None)
+        return True
+    except Exception as e:
+        print(f"[edit_text (bot) fail] {e}")
+        return False
 
 def render_line(row) -> str:
     """Короткая строка для списков."""
@@ -334,7 +363,7 @@ async def cb_pick_category(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_pick_method(call: CallbackQuery, state: FSMContext) -> None:
     method = call.data.split(":", 1)[1]
     # Валидация против фиксированного набора
-    if method not in {"Bank of Company", "USDT", "Cash"}:
+    if method not in {"Bank", "USDT", "Cash"}:
         await call.answer("Unknown method", show_alert=True)
         return
     await state.update_data(method=method)
@@ -355,7 +384,7 @@ async def cb_pick_method_by_id(call: CallbackQuery, state: FSMContext) -> None:
         return
     from generators import get_method_by_id
     m = get_method_by_id(mid)
-    if not m or m["name"] not in {"Bank of Company", "USDT", "Cash"}:
+    if not m or m["name"] not in {"Bank", "USDT", "Cash"}:
         await call.answer("Unknown method", show_alert=True)
         return
     method = m["name"]
@@ -460,30 +489,39 @@ async def cb_approve_staged(call: CallbackQuery) -> None:
     )
     pop_staged(temp_id)
     p = get_payment(pid)
-    # Try to update caption/text with final card (may fail for some media types)
-    try:
-        await call.message.edit_caption(render_card(p))
-    except Exception:
+    final_text = render_card(p)
+    edited = await _safe_edit_final(call.message, final_text)
+    if not edited:
+        # Fallback: resend media (keeping file with updated caption) or plain text, then delete original to avoid duplicates
+        new_msg = None
         try:
-            await call.message.edit_text(render_card(p))
+            gid = get_group_id()
+            if gid:
+                if staged.get('receipt_kind') == 'photo' and staged.get('receipt_file'):
+                    new_msg = await call.bot.send_photo(gid, staged['receipt_file'], caption=final_text)
+                elif staged.get('receipt_kind') == 'document' and staged.get('receipt_file'):
+                    new_msg = await call.bot.send_document(gid, staged['receipt_file'], caption=final_text)
+                else:
+                    new_msg = await call.bot.send_message(gid, final_text)
+        except Exception as e:
+            print(f"[approve fallback send fail] {e}")
+        # Try delete original staged message (removes inline keyboard duplicate)
+        try:
+            await call.message.delete()
+        except Exception as e:
+            print(f"[approve delete original fail] {e}")
+    else:
+        # Save message location for approved payment (optional tracking)
+        try:
+            set_group_message(pid, call.message.chat.id, call.message.message_id)
         except Exception:
             pass
-    # Additionally send a new separate message with full data so it is always visible even if caption edit fails or only photo shown
-    try:
-        gid = get_group_id()
-        if gid:
-            await call.bot.send_message(gid, render_card(p))
-    except Exception:
-        pass
     await call.answer("Approved ✅")
     try:
         log_approval_to_sheet(p)
     except Exception:
         pass
-    try:
-        await call.bot.send_message(p['initiator_id'], f"✅ Request #PAY-{pid} approved.")
-    except Exception:
-        pass
+    # No direct PM to initiator (per requirements)
 
 @router.callback_query(F.data.startswith("reject_staged:"))
 async def cb_reject_staged(call: CallbackQuery) -> None:
@@ -496,32 +534,32 @@ async def cb_reject_staged(call: CallbackQuery) -> None:
     if not staged:
         await call.answer("Nothing to discard", show_alert=True)
         return
-    # Prepare a full info message before removing staged
-    full_info = (
-        f"#PAY-STAGED-{temp_id}\n• {fmt_amount(staged['amount'])} {staged['currency']}\n"\
-        f"• {staged['method']}\n• {staged['category']}\n\n"\
+    final_text = (
+        f"#PAY-STAGED-{temp_id}\n• {fmt_amount(staged['amount'])} {staged['currency']}\n"
+        f"• {staged['method']}\n• {staged['category']}\n\n"
         f"• Description: {staged['description']}\n\nStatus: REJECTED (not saved)\nInitiator: {staged['initiator_id']}\nRejected by: {call.from_user.id}"
     )
     pop_staged(temp_id)
-    try:
-        await call.message.edit_caption("Staged request rejected.")
-    except Exception:
+    edited = await _safe_edit_final(call.message, final_text)
+    if not edited:
+        # Fallback resend + delete original to prevent duplicates
         try:
-            await call.message.edit_text("Staged request rejected.")
-        except Exception:
-            pass
-    # Send separate full data message for history
-    try:
-        gid = get_group_id()
-        if gid:
-            await call.bot.send_message(gid, full_info)
-    except Exception:
-        pass
+            gid = get_group_id()
+            if gid:
+                if staged.get('receipt_kind') == 'photo' and staged.get('receipt_file'):
+                    await call.bot.send_photo(gid, staged['receipt_file'], caption=final_text)
+                elif staged.get('receipt_kind') == 'document' and staged.get('receipt_file'):
+                    await call.bot.send_document(gid, staged['receipt_file'], caption=final_text)
+                else:
+                    await call.bot.send_message(gid, final_text)
+        except Exception as e:
+            print(f"[reject fallback send fail] {e}")
+        try:
+            await call.message.delete()
+        except Exception as e:
+            print(f"[reject delete original fail] {e}")
     await call.answer("Discarded ❌")
-    try:
-        await call.bot.send_message(staged['initiator_id'], "❌ Your staged request was rejected (not saved).")
-    except Exception:
-        pass
+    # No private notification
 
 @router.callback_query(F.data == "nav:back")
 async def cb_nav_back(call: CallbackQuery, state: FSMContext) -> None:
