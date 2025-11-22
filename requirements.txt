@@ -3,3 +3,4 @@ aiogram==3.4.1
 gspread==5.12.0
 google-auth==2.35.0
 python-dotenv==1.0.1
+# SQLite встроен в стандартную библиотеку Python, дополнительных пакетов не требуется

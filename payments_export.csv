@@ -1,0 +1,2 @@
+id,created_at,initiator_id,amount,currency,method,description,status,approved_by,approved_at,rejected_by,rejected_at,group_chat_id,group_msg_id,category
+1,2025-11-22 13:00:28,111,123.0,THB,Cash,A,APPROVED,222,2025-11-22 13:00:28,,,,,CatA

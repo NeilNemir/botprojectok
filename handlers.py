@@ -6,10 +6,13 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 
 from generators import (
     get_group_id, set_group_id, get_roles, set_all_me, set_initiator,
-    list_methods, create_payment, set_group_message, get_payment, approve_payment, reject_payment,
+    list_methods, create_approved_payment, get_payment,
     list_pending, list_user_payments, get_payment_compact, export_payments_csv,
     set_approver, set_viewer,
+    get_config,
 )
+from sheet_logger import log_approval_to_sheet
+from memory_store import put_staged, pop_staged, get_staged
 
 router = Router()
 
@@ -17,32 +20,32 @@ CURRENCY = "THB"  # фиксированная валюта
 
 # ========= Категории расходов =========
 CATEGORIES = [
-    ("🏢 Rent & Utilities", "rent"),
-    ("👥 Salaries & Employee Payments", "salaries"),
-    ("🚚 Transport & Logistics", "transport"),
-    ("📢 Marketing & Advertising", "marketing"),
-    ("💻 IT & Services", "it"),
-    ("📦 Operating Expenses (Other)", "operating"),
+    ("📮 Rent & Utilities", "rent"),
+    ("🥳 Salaries & Employee Payments", "salaries"),
+    ("🛵 Transport & Logistics", "transport"),
+    ("⚡️ Marketing & Advertising", "marketing"),
+    ("👨🏽‍💻 IT & Services", "it"),
+    ("🧐 Operating Expenses (Other)", "operating"),
 ]
 
 def get_category_label_by_code(code: str) -> str:
     for label, c in CATEGORIES:
         if c == code:
             return label
-    return "📦 Operating Expenses (Other)"
+    return "🧐 Operating Expenses (Other)"
 
 # ========= Клавиатуры =========
 def kb_nav(back: bool = True) -> InlineKeyboardMarkup:
     rows = []
     if back:
-        rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back")])
-    rows.append([InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")])
+        rows.append([InlineKeyboardButton(text="👈🏼 Back", callback_data="nav:back")])
+    rows.append([InlineKeyboardButton(text="🙅🏽‍♂️ Cancel", callback_data="nav:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def category_kb() -> InlineKeyboardMarkup:
     rows = [[InlineKeyboardButton(text=label, callback_data=f"cat:{code}")] for label, code in CATEGORIES]
-    rows.append([InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"),
-                 InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")])
+    rows.append([InlineKeyboardButton(text="👈🏼 Back", callback_data="nav:back"),
+                 InlineKeyboardButton(text="🙅🏽‍♂️ Cancel", callback_data="nav:cancel")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
@@ -53,16 +56,16 @@ def methods_kb(include_nav: bool = True) -> InlineKeyboardMarkup:
             rows.append([InlineKeyboardButton(text=name, callback_data=f"methodid:{mid}")])
     if include_nav:
         rows.append([
-            InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"),
-            InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")
+            InlineKeyboardButton(text="👈🏼 Back", callback_data="nav:back"),
+            InlineKeyboardButton(text="🙅🏽‍♂️ Cancel", callback_data="nav:cancel")
         ])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
+# legacy keyboard retained for backward compatibility (old pending items if any)
 def kb_group_approve(pid: int) -> InlineKeyboardMarkup:
-    # Единая кнопка Approve без привязки к этапу + Reject
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Approve", callback_data=f"approve:{pid}"),
-        InlineKeyboardButton(text="❌ Reject", callback_data=f"reject:{pid}")
+        InlineKeyboardButton(text="🔋 Approve", callback_data=f"approve_legacy:{pid}"),
+        InlineKeyboardButton(text="🪫 Reject", callback_data=f"reject_legacy:{pid}")
     ]])
 
 # ========= Утилиты =========
@@ -73,7 +76,7 @@ def fmt_amount(val: float) -> str:
     return s
 
 def render_card(p: dict) -> str:
-    category_text = p.get("category") or "📦 Operating Expenses (Other)"
+    category_text = p.get("category") or "🧐 Operating Expenses (Other)"
     lines = [
         f"#PAY-{p['id']}",
         f"• {fmt_amount(p['amount'])} {p.get('currency', CURRENCY)}",
@@ -95,7 +98,7 @@ def render_card(p: dict) -> str:
 
 def render_line(row) -> str:
     """Короткая строка для списков."""
-    cat = row.get("category") or "📦 Operating Expenses (Other)"
+    cat = row.get("category") or "🧐 Operating Expenses (Other)"
     return f"#PAY-{row['id']} — {fmt_amount(row['amount'])} {row['currency']} — {row['method']} — {cat} — {row['status']} — {row['created_at']}"
 
 # ========= Базовые команды =========
@@ -139,7 +142,7 @@ async def cmd_set_all_me_cmd(message: Message) -> None:
 async def cmd_set_initiator_cmd(message: Message) -> None:
     """
     Использование: /set_initiator <id>
-    Менять может только текущий initiator (если уже есть).
+    Менять может только текущий initiator (или secondary_initiator).
     Если initiатор ещё не задан — первый вызов команды создаст его.
     """
     roles = get_roles()
@@ -152,9 +155,13 @@ async def cmd_set_initiator_cmd(message: Message) -> None:
 
     new_init = int(parts[1])
 
-    # Если инициатор уже задан — менять может только он
-    if current_init is not None and message.from_user.id != current_init:
-        await message.answer("Only current initiator can change initiator ID.")
+    # Если инициатор уже задан — менять может только он или второй инициатор
+    sec = get_config("secondary_initiator_id", None, int)
+    allowed = {current_init, sec}
+    if None in allowed:
+        allowed.discard(None)
+    if current_init is not None and message.from_user.id not in allowed:
+        await message.answer("Only current initiators can change initiator ID.")
         return
 
     set_initiator(new_init)
@@ -164,11 +171,15 @@ async def cmd_set_initiator_cmd(message: Message) -> None:
 async def cmd_set_approver_cmd(message: Message) -> None:
     """
     Использование: /set_approver <id>
-    Менять может текущий initiator.
+    Менять может текущий initiator или secondary_initiator.
     """
     roles = get_roles()
-    if not roles["initiator_id"] or message.from_user.id != roles["initiator_id"]:
-        await message.answer("Only initiator can change approver. Ask admin to change roles.")
+    sec = get_config("secondary_initiator_id", None, int)
+    allowed = {roles.get("initiator_id"), sec}
+    if None in allowed:
+        allowed.discard(None)
+    if not allowed or message.from_user.id not in allowed:
+        await message.answer("Only initiators can change approver. Ask admin to change roles.")
         return
 
     parts = (message.text or "").split()
@@ -184,11 +195,15 @@ async def cmd_set_approver_cmd(message: Message) -> None:
 async def cmd_set_viewer_cmd(message: Message) -> None:
     """
     Использование: /set_viewer <id>
-    Менять может текущий initiator.
+    Менять может текущий initiator или secondary_initiator.
     """
     roles = get_roles()
-    if not roles["initiator_id"] or message.from_user.id != roles["initiator_id"]:
-        await message.answer("Only initiator can change viewer. Ask admin to change roles.")
+    sec = get_config("secondary_initiator_id", None, int)
+    allowed = {roles.get("initiator_id"), sec}
+    if None in allowed:
+        allowed.discard(None)
+    if not allowed or message.from_user.id not in allowed:
+        await message.answer("Only initiators can change viewer. Ask admin to change roles.")
         return
 
     parts = (message.text or "").split()
@@ -268,7 +283,8 @@ class PaymentForm(StatesGroup):
     amount = State()
     category_select = State()
     method_select = State()
-    description = State()
+    receipt = State()      # now BEFORE description
+    description = State()  # moved after receipt
 
 @router.message(Command("newpay"))
 async def newpay_start(message: Message, state: FSMContext) -> None:
@@ -276,8 +292,13 @@ async def newpay_start(message: Message, state: FSMContext) -> None:
     if roles["initiator_id"] is None:
         set_initiator(message.from_user.id)
         roles = get_roles()
-    if roles["initiator_id"] and message.from_user.id != roles["initiator_id"]:
-        await message.answer("Only initiator can create a request. Ask admin to change roles.")
+    # allow primary and secondary initiators
+    sec = get_config("secondary_initiator_id", None, int)
+    allowed = {roles.get("initiator_id"), sec}
+    if None in allowed:
+        allowed.discard(None)
+    if message.from_user.id not in allowed:
+        await message.answer("Only initiators can create a request. Ask admin to change roles.")
         return
     await state.clear()
     await state.set_state(PaymentForm.amount)
@@ -317,135 +338,192 @@ async def cb_pick_method(call: CallbackQuery, state: FSMContext) -> None:
         await call.answer("Unknown method", show_alert=True)
         return
     await state.update_data(method=method)
-    await state.set_state(PaymentForm.description)
-    await call.message.edit_text(f"Method: {method}\nNow enter description (any language):", reply_markup=kb_nav(back=True))
+    await state.set_state(PaymentForm.receipt)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Skip", callback_data="receipt:skip")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"), InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")]
+    ])
+    await call.message.edit_text(f"Method: {method}\nAttach receipt (photo/document) or Skip.", reply_markup=kb)
     await call.answer()
+
+@router.callback_query(F.data.startswith("methodid:"))
+async def cb_pick_method_by_id(call: CallbackQuery, state: FSMContext) -> None:
+    try:
+        mid = int(call.data.split(":", 1)[1])
+    except Exception:
+        await call.answer("Bad method", show_alert=True)
+        return
+    from generators import get_method_by_id
+    m = get_method_by_id(mid)
+    if not m or m["name"] not in {"Bank of Company", "USDT", "Cash"}:
+        await call.answer("Unknown method", show_alert=True)
+        return
+    method = m["name"]
+    await state.update_data(method=method)
+    await state.set_state(PaymentForm.receipt)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="➡️ Skip", callback_data="receipt:skip")],
+        [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"), InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")]
+    ])
+    await call.message.edit_text(f"Method: {method}\nAttach receipt (photo/document) or Skip.", reply_markup=kb)
+    await call.answer()
+
+@router.callback_query(F.data == "receipt:skip")
+async def cb_receipt_skip(call: CallbackQuery, state: FSMContext) -> None:
+    # skip receipt and ask description
+    await state.update_data(receipt_file=None, receipt_kind=None)
+    await state.set_state(PaymentForm.description)
+    await call.message.edit_text("Enter description (any language):", reply_markup=kb_nav(back=True))
+    await call.answer()
+
+@router.message(PaymentForm.receipt, F.photo)
+async def newpay_receipt_photo(message: Message, state: FSMContext) -> None:
+    photo = message.photo[-1] if message.photo else None
+    fid = photo.file_id if photo else None
+    await state.update_data(receipt_file=fid, receipt_kind="photo")
+    await state.set_state(PaymentForm.description)
+    await message.answer("Receipt saved. Now enter description:", reply_markup=kb_nav(back=True))
+
+@router.message(PaymentForm.receipt, F.document)
+async def newpay_receipt_document(message: Message, state: FSMContext) -> None:
+    doc = message.document
+    fid = doc.file_id if doc else None
+    await state.update_data(receipt_file=fid, receipt_kind="document")
+    await state.set_state(PaymentForm.description)
+    await message.answer("Receipt saved. Now enter description:", reply_markup=kb_nav(back=True))
+
+@router.message(PaymentForm.receipt)
+async def newpay_receipt_other(message: Message, state: FSMContext) -> None:
+    await message.answer("Send photo/document or press Skip.")
 
 @router.message(PaymentForm.description)
 async def newpay_description(message: Message, state: FSMContext) -> None:
     desc = (message.text or "").strip()
+    await state.update_data(description=desc)
     data = await state.get_data()
-    await state.clear()
-
-    pid = create_payment(
-        initiator_id=message.from_user.id,
-        amount=data["amount"],
-        currency=CURRENCY,
-        method=data["method"],
-        description=desc,
-        category=data.get("category") or "📦 Operating Expenses (Other)"
-    )
-    p = get_payment(pid)
-
     group_id = get_group_id()
     if not group_id:
-        await message.answer("❗ Group is not set. Send /setup_here in the target group, then try /newpay again.")
+        await message.answer("❗ Group is not set. Send /setup_here in the target group, then try again.")
+        await state.clear()
         return
-    sent = await message.bot.send_message(chat_id=group_id, text=render_card(p), reply_markup=kb_group_approve(pid))
-    set_group_message(pid, group_id, sent.message_id)
-
-    await message.answer(f"Request #PAY-{pid} posted to the group for approval.")
-
-# ========= Навигация формы (Back/Cancel) =========
-@router.callback_query(F.data == "nav:cancel")
-async def cb_nav_cancel(call: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
+    import time
+    temp_id = int(time.time())  # simplistic unique id
+    staged = {
+        "initiator_id": message.from_user.id,
+        "amount": data["amount"],
+        "currency": CURRENCY,
+        "method": data["method"],
+        "description": desc,
+        "category": data.get("category") or "🧐 Operating Expenses (Other)",
+        "receipt_file": data.get("receipt_file"),
+        "receipt_kind": data.get("receipt_kind"),
+    }
+    put_staged(temp_id, staged)
+    preview = (
+        f"#PAY-STAGED-{temp_id}\n• {fmt_amount(staged['amount'])} {CURRENCY}\n• {staged['method']}\n" \
+        f"• {staged['category']}\n\n" \
+        f"• Description: {desc}\n\nStatus: WAITING APPROVAL (not saved)\nInitiator: {message.from_user.id}\n"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Approve", callback_data=f"approve_staged:{temp_id}"), InlineKeyboardButton(text="❌ Reject", callback_data=f"reject_staged:{temp_id}")]])
+    receipt_file = staged.get('receipt_file')
+    receipt_kind = staged.get('receipt_kind')
     try:
-        await call.message.edit_text("❌ Form cancelled.")
+        if receipt_file and receipt_kind == 'photo':
+            await message.bot.send_photo(chat_id=group_id, photo=receipt_file, caption=preview, reply_markup=kb)
+        elif receipt_file and receipt_kind == 'document':
+            await message.bot.send_document(chat_id=group_id, document=receipt_file, caption=preview, reply_markup=kb)
+        else:
+            await message.bot.send_message(chat_id=group_id, text=preview, reply_markup=kb)
     except Exception:
-        await call.message.answer("❌ Form cancelled.")
-    await call.answer()
+        await message.bot.send_message(chat_id=group_id, text=preview, reply_markup=kb)
+    await message.answer("Staged request posted for approval. It will be saved only if approved.")
+
+@router.callback_query(F.data.startswith("approve_staged:"))
+async def cb_approve_staged(call: CallbackQuery) -> None:
+    roles = get_roles()
+    if call.from_user.id != roles.get('approver_id'):
+        await call.answer("Not approver", show_alert=True)
+        return
+    temp_id = int(call.data.split(":")[1])
+    staged = get_staged(temp_id)
+    if not staged:
+        await call.answer("Staged data missing", show_alert=True)
+        return
+    # create approved payment directly (skip PENDING)
+    pid = create_approved_payment(
+        initiator_id=staged['initiator_id'],
+        approver_id=call.from_user.id,
+        amount=staged['amount'],
+        currency=staged['currency'],
+        method=staged['method'],
+        description=staged['description'],
+        category=staged['category']
+    )
+    pop_staged(temp_id)
+    p = get_payment(pid)
+    try:
+        await call.message.edit_caption(render_card(p))
+    except Exception:
+        try:
+            await call.message.edit_text(render_card(p))
+        except Exception:
+            pass
+    await call.answer("Approved ✅")
+    try:
+        log_approval_to_sheet(p)
+    except Exception:
+        pass
+    try:
+        await call.bot.send_message(p['initiator_id'], f"✅ Request #PAY-{pid} approved.")
+    except Exception:
+        pass
+
+@router.callback_query(F.data.startswith("reject_staged:"))
+async def cb_reject_staged(call: CallbackQuery) -> None:
+    roles = get_roles()
+    if call.from_user.id != roles.get('approver_id'):
+        await call.answer("Not approver", show_alert=True)
+        return
+    temp_id = int(call.data.split(":")[1])
+    staged = pop_staged(temp_id)
+    if not staged:
+        await call.answer("Nothing to discard", show_alert=True)
+        return
+    try:
+        await call.message.edit_caption("Staged request discarded.")
+    except Exception:
+        try:
+            await call.message.edit_text("Staged request discarded.")
+        except Exception:
+            pass
+    await call.answer("Discarded ❌")
+    try:
+        await call.bot.send_message(staged['initiator_id'], "❌ Your staged request was discarded (not saved).")
+    except Exception:
+        pass
 
 @router.callback_query(F.data == "nav:back")
 async def cb_nav_back(call: CallbackQuery, state: FSMContext) -> None:
     cur = await state.get_state()
     data = await state.get_data()
-    # Определяем предыдущий шаг по текущему состоянию
-    if cur == PaymentForm.category_select.state:
-        await state.set_state(PaymentForm.amount)
-        amt = data.get("amount")
-        prefix = f"(current: {amt}) " if amt is not None else ""
-        try:
-            await call.message.edit_text(f"{prefix}How much? ({CURRENCY})", reply_markup=kb_nav(back=False))
-        except Exception:
-            await call.message.answer(f"{prefix}How much? ({CURRENCY})", reply_markup=kb_nav(back=False))
-    elif cur == PaymentForm.method_select.state:
+    if cur == PaymentForm.method_select.state:
+        # back to category
         await state.set_state(PaymentForm.category_select)
         await call.message.edit_text("Select expense category:", reply_markup=category_kb())
-    elif cur == PaymentForm.description.state:
+    elif cur == PaymentForm.receipt.state:
         await state.set_state(PaymentForm.method_select)
         await call.message.edit_text("Select payment method:", reply_markup=methods_kb(include_nav=True))
+    elif cur == PaymentForm.description.state:
+        await state.set_state(PaymentForm.receipt)
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="➡️ Skip", callback_data="receipt:skip")],
+            [InlineKeyboardButton(text="⬅️ Back", callback_data="nav:back"), InlineKeyboardButton(text="✖️ Cancel", callback_data="nav:cancel")]
+        ])
+        await call.message.edit_text("Attach receipt (photo/document) or Skip.", reply_markup=kb)
     else:
         await call.answer("Nothing to go back to.", show_alert=True)
         return
     await call.answer()
-
-# ========= CALLBACKS ГРУППЫ (Approve/Reject) =========
-@router.callback_query(F.data.startswith("approve:"))
-async def cb_approve_payment(call: CallbackQuery) -> None:
-    pid = int(call.data.split(":")[1])
-
-    roles = get_roles()
-    # Только указанный approver может согласовывать
-    if call.from_user.id != roles["approver_id"]:
-        await call.answer("You are not the designated approver", show_alert=True)
-        return
-
-    p = get_payment(pid)
-    if not p:
-        await call.answer("Payment not found", show_alert=True)
-        return
-
-    # Одноэтапное согласование
-    if p["status"] != "PENDING":
-        await call.answer(f"Already finalized: {p['status']}", show_alert=True)
-        return
-
-    ok, msg = approve_payment(pid, approver_id=call.from_user.id)
-    if not ok:
-        await call.answer(msg, show_alert=True)
-        return
-
-    p = get_payment(pid)
-    await call.message.edit_text(render_card(p))  # финал — без кнопок
-    await call.answer("Approved ✅")
-    
-    # Уведомляем инициатора
-    try:
-        await call.bot.send_message(p["initiator_id"], f"✅ Request #PAY-{pid} approved.")
-    except Exception:
-        pass
-    
-    # Уведомляем viewer для ознакомления
-    try:
-        if roles["viewer_id"] and roles["viewer_id"] != call.from_user.id:
-            await call.bot.send_message(roles["viewer_id"], f"ℹ️ Payment approved for review:\n{render_card(p)}")
-    except Exception:
-        pass
-
-@router.callback_query(F.data.startswith("reject:"))
-async def cb_reject(call: CallbackQuery) -> None:
-    pid = int(call.data.split(":")[1])
-
-    roles = get_roles()
-    # Только указанный approver может отклонять
-    if call.from_user.id != roles["approver_id"]:
-        await call.answer("You are not the designated approver", show_alert=True)
-        return
-
-    ok, msg = reject_payment(pid, approver_id=call.from_user.id)
-    if not ok:
-        await call.answer(msg, show_alert=True)
-        return
-
-    p = get_payment(pid)
-    await call.message.edit_text(render_card(p))
-    await call.answer("Rejected ❌")
-
-    try:
-        await call.bot.send_message(p["initiator_id"], f"❌ Request #PAY-{pid} rejected.")
-    except Exception:
-        pass
 
 # ========= Эхо =========
 @router.message()

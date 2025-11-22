@@ -1,19 +1,23 @@
 services:
-  mybot:
-    build: .
-    image: mybot:latest
+  bot:
+    build:
+      context: .
+      args:
+        - CACHE_BUST=${CACHE_BUST:-0}
+    image: botprojectok:latest
+    container_name: botprojectok
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - GSHEET_ID=${GSHEET_ID}
-      - GSHEET_TAB=${GSHEET_TAB}
-      - GOOGLE_APPLICATION_CREDENTIALS=/app/credentials.json
+      - PYTHONUNBUFFERED=1
+      - DB_PATH=${DB_PATH:-/app/data/botdata.db}
+      - TZ=${TZ:-Europe/Moscow}
+      - CACHE_BUST=${CACHE_BUST:-0}
+      - GROUP_ID=${GROUP_ID:-}
+      - INITIATORS=${INITIATORS:-}
     volumes:
-      - ./botdata.db:/app/botdata.db
+      - ./logs:/app/logs
+      - ./data:/app/data
       - ./credentials.json:/app/credentials.json:ro
-    networks:
-      - bots
 
-networks:
-  bots:
-    external: true
